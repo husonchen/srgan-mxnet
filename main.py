@@ -192,9 +192,9 @@ def plot_loss(losses_log,global_step,epoch, i):
     print(message)
 
 def plot_img(losses_log):
-    sw.add_image(tag='lr_img', image=nd.clip(nd.concatenate([losses_log['lr_img'][0][0:4]]), 0, 1))
-    sw.add_image(tag='hr_img', image=nd.clip(nd.concatenate([losses_log['hr_img'][0][0:4]]), 0, 1))
-    sw.add_image(tag='hr_img_fake', image=nd.clip(nd.concatenate([losses_log['hr_img_fake'][0][0:4]]), 0, 1))
+    sw.add_image(tag='lr_img', image=nd.clip(nd.concatenate(losses_log['lr_img'])[0:4], 0, 1))
+    sw.add_image(tag='hr_img', image=nd.clip(nd.concatenate(losses_log['hr_img'])[0:4], 0, 1))
+    sw.add_image(tag='hr_img_fake', image=nd.clip(nd.concatenate(losses_log['hr_img_fake'])[0:4], 0, 1))
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataroot', required=True, help='path to images')
@@ -203,15 +203,16 @@ parser.add_argument('--gpu_ids', type=str, default='0', help='gpu ids: e.g. 0  0
 parser.add_argument('--workers', type=int, help='number of data loading workers', default=6)
 parser.add_argument('--experiment', default=None, help='Where to store models')
 parser.add_argument('--fineSize', type=int, default=384, help='then crop to this size')
-parser.add_argument('--n_epoch_init', type=int, default=100, help='# of iter at pretrained')
+parser.add_argument('--n_epoch_init', type=int, default=0, help='# of iter at pretrained')
 parser.add_argument('--n_epoch', type=int, default=2000, help='# of iter at training')
 parser.add_argument('--beta1', type=float, default=0.9, help='momentum term of adam')
 parser.add_argument('--lr_init', type=float, default=1e-4, help='initial learning rate for pretrain')
 parser.add_argument('--lr_decay', type=float, default=0.1, help='initial learning rate for adam')
 
+
 opt = parser.parse_args()
 print(opt)
-sw = SummaryWriter(logdir='./logs', flush_secs=5)
+sw = SummaryWriter(logdir='./logs_2', flush_secs=5)
 decay_every = int(opt.n_epoch / 2)
 
 opt.manualSeed = 10#random.randint(1, 10000) # fix seed
@@ -226,7 +227,7 @@ os.system('mkdir {0}'.format(opt.experiment))
 if opt.gpu_ids == '-1':
     context = [mx.cpu()]
 else:
-    context = mx.gpu(0)#[mx.gpu(int(i)) for i in opt.gpu_ids.split(',') if i.strip()]
+    context = [mx.gpu(int(i)) for i in opt.gpu_ids.split(',') if i.strip()]
 
 dommy_img = nd.random.uniform(0,1,(1,3,int(opt.fineSize/4),int(opt.fineSize/4)),ctx=mx.gpu(0))
 netG = SRGenerator()
@@ -234,7 +235,7 @@ netD = SRDiscriminator()
 vgg19 = vision.vgg19(pretrained=True,ctx=context)
 features = vgg19.features[:28]
 
-netG.initialize(ctx=mx.gpu(0))
+netG.initialize(mx.initializer.Normal(),ctx=mx.gpu(0))
 dommy_out = netG(dommy_img)
 weights_init(netG.collect_params())
 netG.collect_params().reset_ctx(context)
@@ -242,7 +243,6 @@ netD.initialize(ctx=mx.gpu(0))
 netD(dommy_out)
 weights_init(netD.collect_params())
 netD.collect_params().reset_ctx(context)
-
 
 dataset = DataSet(opt.dataroot,RandomCrop(opt.fineSize),transforms.Resize(int(opt.fineSize / 4),interpolation=3),transforms.Compose([
                             transforms.ToTensor(),
@@ -254,8 +254,7 @@ dataloader = DataLoader(dataset, batch_size=opt.batchSize,
 optimizer_G = gluon.Trainer(netG.collect_params(), 'adam', {'learning_rate': opt.lr_init,'beta1':opt.beta1},kvstore='local')
 optimizer_D = gluon.Trainer(netD.collect_params(), 'adam', {'learning_rate': opt.lr_init,'beta1':opt.beta1},kvstore='local')
 
-real_label = nd.ones((opt.batchSize,), ctx=context)
-fake_label = nd.zeros((opt.batchSize,),ctx=context)
+
 
 def mse_loss(input,target):
     e = ((input - target) ** 2).mean(axis=0, exclude=True)
@@ -263,20 +262,19 @@ def mse_loss(input,target):
 loss_d = gluon.loss.SigmoidBinaryCrossEntropyLoss()
 
 for epoch in range(opt.n_epoch_init):
-
     for i, (hr_img, lr_img) in enumerate(dataloader):
-        # hr_img = nd.array(np.load('../384img.npy').transpose([0, 3, 1, 2]))
-        # lr_img = nd.array(np.load('../96img.npy').transpose([0, 3, 1, 2]))
-        # hr_img = gluon.utils.split_and_load(hr_img, ctx_list=context, batch_axis=0)
-        # lr_img = gluon.utils.split_and_load(lr_img, ctx_list=context, batch_axis=0)
-        hr_img = hr_img.as_in_context(context)
-        lr_img = lr_img.as_in_context(context)
+        hr_img_list = gluon.utils.split_and_load(hr_img, ctx_list=context, batch_axis=0)
+        lr_img_list = gluon.utils.split_and_load(lr_img, ctx_list=context, batch_axis=0)
+        loss_list = []
         with autograd.record():
-            hr_img_predit = netG(lr_img)
-            loss = mse_loss(hr_img_predit,hr_img)
-            autograd.backward(loss)
+            for ix, hr_img in enumerate(hr_img_list):
+                lr_img = lr_img_list[ix]
+                hr_img_predit = netG(lr_img)
+                loss = mse_loss(hr_img_predit,hr_img)
+                loss_list.append(loss)
+            autograd.backward(loss_list)
         optimizer_G.step(opt.batchSize)
-        print("Epoch %d:  mse: %.8f " % (epoch, loss.mean().asscalar()))
+        print("Epoch %d:  mse: %.8f " % (epoch, nd.concatenate(loss_list).mean().asscalar()))
     netG.save_parameters('{0}/netG_init_epoch_{1}.pth'.format(opt.experiment, epoch))
 
 class loss_dict:
@@ -295,14 +293,21 @@ class loss_dict:
 
     def __getitem__(self, item):
         return self.losses[item]
-mean_mask = nd.zeros((opt.batchSize,3,opt.fineSize,opt.fineSize),ctx=context)
+
+real_label = nd.ones((opt.batchSize,))
+fake_label = nd.zeros((opt.batchSize,))
+mean_mask = nd.zeros((opt.batchSize,3,opt.fineSize,opt.fineSize))
 mean_mask[:,0,:,:] = 0.485
 mean_mask[:,1,:,:] = 0.456
 mean_mask[:,2,:,:] = 0.406
-std_mask = nd.zeros((opt.batchSize,3,opt.fineSize,opt.fineSize),ctx=context)
+std_mask = nd.zeros((opt.batchSize,3,opt.fineSize,opt.fineSize))
 std_mask[:,0,:,:] = 0.229
 std_mask[:,1,:,:] = 0.224
 std_mask[:,2,:,:] = 0.225
+real_label_list = gluon.utils.split_and_load(real_label, ctx_list=context, batch_axis=0)
+fake_label_list = gluon.utils.split_and_load(fake_label, ctx_list=context, batch_axis=0)
+mean_mask_list = gluon.utils.split_and_load(mean_mask, ctx_list=context, batch_axis=0)
+std_mask_list = gluon.utils.split_and_load(std_mask, ctx_list=context, batch_axis=0)
 
 # gen_iterations = 0
 losses_log = loss_dict()
@@ -310,38 +315,53 @@ dataloader_len = len(dataloader)
 for epoch in range(0, opt.n_epoch):
     for i, (hr_img, lr_img) in enumerate(dataloader):
         losses_log.reset()
-        # hr_img = nd.array(np.load('../384img.npy').transpose([0, 3, 1, 2]))
-        # lr_img = nd.array(np.load('../96img.npy').transpose([0, 3, 1, 2]))
-        hr_img = hr_img.as_in_context(context)
-        lr_img = lr_img.as_in_context(context)
+        hr_img_list = gluon.utils.split_and_load(hr_img, ctx_list=context, batch_axis=0)
+        lr_img_list = gluon.utils.split_and_load(lr_img, ctx_list=context, batch_axis=0)
+        errD_list = []
+        hr_img_fake_list = []
         with autograd.record():
-            output = netD(hr_img).reshape((-1, 1))
-            errD_real = loss_d(output, real_label)
+            for ix, hr_img in enumerate(hr_img_list):
+                lr_img = lr_img_list[ix]
+                real_label = real_label_list[ix]
+                fake_label = fake_label_list[ix]
 
-            hr_img_fake = netG(lr_img)
-            output = netD(hr_img_fake.detach()).reshape((-1, 1))
-            errD_fake = loss_d(output, fake_label)
-            errD = errD_real + errD_fake
-        autograd.backward(errD)
+                output = netD(hr_img).reshape((-1, 1))
+                errD_real = loss_d(output, real_label)
+
+                hr_img_fake = netG(lr_img)
+                output = netD(hr_img_fake.detach()).reshape((-1, 1))
+                errD_fake = loss_d(output, fake_label)
+                errD = errD_real + errD_fake
+                errD_list.append(errD)
+                hr_img_fake_list.append(hr_img_fake)
+                losses_log.add(errD=errD)
+                losses_log.add(lr_img=lr_img, hr_img=hr_img, hr_img_fake=hr_img_fake)
+            autograd.backward(errD_list)
         optimizer_D.step(opt.batchSize)
-        losses_log.add(errD=errD)
-        losses_log.add(lr_img=lr_img,hr_img=hr_img,hr_img_fake=hr_img_fake)
+        errG_list = []
         with autograd.record():
-            errM = mse_loss(hr_img_fake,hr_img)
-            fake_emb = features(((hr_img_fake + 1)/2 - mean_mask)/std_mask)
-            real_emb = features(((hr_img + 1)/2 - mean_mask)/std_mask)
-            errV = 3e-2 * mse_loss(fake_emb,real_emb)
-            output = netD(hr_img_fake).reshape((-1, 1))
-            errA = 1e-3 * loss_d(output,real_label)
-            errG = errM + errV + errA
-        autograd.backward(errG)
+            for ix, hr_img in enumerate(hr_img_list):
+                lr_img = lr_img_list[ix]
+                hr_img_fake = hr_img_fake_list[ix]
+                mean_mask = mean_mask_list[ix]
+                std_mask = std_mask_list[ix]
+                real_label = real_label_list[ix]
+                errM = mse_loss(hr_img_fake,hr_img)
+                fake_emb = features(((hr_img_fake + 1)/2 - mean_mask)/std_mask)
+                real_emb = features(((hr_img + 1)/2 - mean_mask)/std_mask)
+                errV = 0.006 * mse_loss(fake_emb,real_emb)
+                output = netD(hr_img_fake).reshape((-1, 1))
+                errA = 1e-3 * loss_d(output,real_label)
+                errG = errM + errV + errA
+                errG_list.append(errG)
+                losses_log.add(errG=errG, errM=errM, errV=errV, errA=errA)
+            autograd.backward(errG_list)
         optimizer_G.step(opt.batchSize)
-        losses_log.add(errG=errG,errM=errM, errV=errV, errA=errA)
         plot_loss(losses_log,epoch * dataloader_len + i,epoch,i)
+    plot_img(losses_log)
     if epoch != 0 and (epoch % decay_every == 0):
         optimizer_G.set_learning_rate(optimizer_G.learning_rate * opt.lr_decay)
         optimizer_D.set_learning_rate(optimizer_D.learning_rate * opt.lr_decay)
     if (epoch != 0) and (epoch % 10 == 0):
-        plot_img(losses_log)
         netG.save_parameters('{0}/netG_epoch_{1}.pth'.format(opt.experiment, epoch))
         netD.save_parameters('{0}/netD_epoch_{1}.pth'.format(opt.experiment, epoch))
